@@ -19,8 +19,11 @@ public class JwtMiddleware
     {
         "/api/auth/login",
         "/api/auth/register",
-        "/swagger"
-        // Removed "/" to ensure ALL API endpoints require JWT validation
+        "/swagger",
+        "/swagger/v1/swagger.json",
+        "/swagger/index.html",
+        "/_framework",
+        "/_vs"
     };
 
     public JwtMiddleware(RequestDelegate next, IConfiguration configuration)
@@ -31,13 +34,12 @@ public class JwtMiddleware
 
     public async Task Invoke(HttpContext context)
     {
-        // Debug logging - Shows middleware is processing requests
         Console.WriteLine($"🔐 JWT Middleware: Processing {context.Request.Method} {context.Request.Path.Value}");
 
         // Skip JWT validation for excluded paths
         if (IsExcludedPath(context.Request.Path.Value))
         {
-            Console.WriteLine($"🔓 Excluded from JWT validation");
+            Console.WriteLine($"🔓 Excluded from JWT validation: {context.Request.Path.Value}");
             await _next(context);
             return;
         }
@@ -54,42 +56,87 @@ public class JwtMiddleware
             return;
         }
 
-        Console.WriteLine($"✅ Authorization header found - validating token");
-
         var authHeader = context.Request.Headers.Authorization.FirstOrDefault();
+        Console.WriteLine($"📋 Raw Authorization header: '{authHeader}'");
 
-        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
+        if (string.IsNullOrEmpty(authHeader))
         {
+            Console.WriteLine($"❌ Authorization header is empty");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync("{\"error\": \"Invalid Authorization header format. Use 'Bearer <token>'\"}");
+            await context.Response.WriteAsync("{\"error\": \"Authorization header is empty\"}");
             return;
         }
 
-        var token = authHeader.Replace("Bearer ", "");
+        // ✅ FIX: More robust token extraction
+        string token;
 
+        if (authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            // Extract token after "Bearer "
+            token = authHeader.Substring(7).Trim();
+        }
+        else if (authHeader.StartsWith("bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            // Handle lowercase "bearer"
+            token = authHeader.Substring(7).Trim();
+        }
+        else
+        {
+            // If no "Bearer " prefix, treat the whole string as token (fallback)
+            token = authHeader.Trim();
+        }
+
+        Console.WriteLine($"🎫 Extracted token (first 20 chars): '{token.Substring(0, Math.Min(20, token.Length))}...'");
+        Console.WriteLine($"📏 Token length: {token.Length}");
+
+        // ✅ Validate token is not empty after extraction
         if (string.IsNullOrWhiteSpace(token))
         {
+            Console.WriteLine($"❌ JWT token is empty after extraction");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync("{\"error\": \"JWT token is empty\"}");
             return;
         }
 
+        // ✅ Check if token has the correct JWT format (should have 2 dots)
+        if (token.Split('.').Length != 3)
+        {
+            Console.WriteLine($"❌ JWT token is malformed - expected 3 parts separated by dots, got {token.Split('.').Length}");
+            context.Response.StatusCode = 401;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync("{\"error\": \"JWT token is malformed. Token must be in format: header.payload.signature\"}");
+            return;
+        }
+
         try
         {
             var tokenHandler = new JwtSecurityTokenHandler();
-            var key = Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]);
 
-            if (string.IsNullOrEmpty(_configuration["Jwt:Key"]))
+            // ✅ Validate that the token can be read before attempting validation
+            if (!tokenHandler.CanReadToken(token))
             {
+                Console.WriteLine($"❌ Token cannot be read - not a valid JWT format");
+                context.Response.StatusCode = 401;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync("{\"error\": \"Invalid JWT token format\"}");
+                return;
+            }
+
+            var jwtKey = _configuration["Jwt:Key"];
+            if (string.IsNullOrEmpty(jwtKey))
+            {
+                Console.WriteLine($"❌ JWT configuration is missing");
                 context.Response.StatusCode = 500;
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync("{\"error\": \"JWT configuration is missing\"}");
                 return;
             }
 
-            tokenHandler.ValidateToken(token, new TokenValidationParameters
+            var key = Encoding.UTF8.GetBytes(jwtKey);
+
+            var validationParameters = new TokenValidationParameters
             {
                 ValidateIssuer = true,
                 ValidateAudience = true,
@@ -98,52 +145,68 @@ public class JwtMiddleware
                 ValidIssuer = _configuration["Jwt:Issuer"],
                 ValidAudience = _configuration["Jwt:Audience"],
                 IssuerSigningKey = new SymmetricSecurityKey(key),
-                ClockSkew = TimeSpan.Zero // No tolerance for token expiration
-            }, out SecurityToken validatedToken);
+                ClockSkew = TimeSpan.Zero
+            };
 
+            Console.WriteLine($"🔍 Validating token...");
+            Console.WriteLine($"   Issuer: {_configuration["Jwt:Issuer"]}");
+            Console.WriteLine($"   Audience: {_configuration["Jwt:Audience"]}");
+
+            var principal = tokenHandler.ValidateToken(token, validationParameters, out SecurityToken validatedToken);
             var jwtToken = (JwtSecurityToken)validatedToken;
+
+            Console.WriteLine($"✅ JWT token validated successfully");
+            Console.WriteLine($"   Claims count: {jwtToken.Claims.Count()}");
 
             // Extract and store user information in HttpContext.Items
             var userIdClaim = jwtToken.Claims.FirstOrDefault(x => x.Type == "nameid");
             var usernameClaim = jwtToken.Claims.FirstOrDefault(x => x.Type == "sub");
 
             if (userIdClaim != null)
+            {
                 context.Items["UserId"] = userIdClaim.Value;
+                Console.WriteLine($"   UserId: {userIdClaim.Value}");
+            }
 
             if (usernameClaim != null)
+            {
                 context.Items["Username"] = usernameClaim.Value;
+                Console.WriteLine($"   Username: {usernameClaim.Value}");
+            }
 
             // Store the whole JWT token for potential future use
             context.Items["JwtToken"] = jwtToken;
 
-            // Set user principal if needed
-            var identity = new System.Security.Claims.ClaimsIdentity("Jwt");
-            identity.AddClaims(jwtToken.Claims);
-            context.User = new System.Security.Claims.ClaimsPrincipal(identity);
+            // Set user principal
+            context.User = principal;
         }
-        catch (SecurityTokenExpiredException)
+        catch (SecurityTokenExpiredException ex)
         {
+            Console.WriteLine($"❌ JWT token has expired: {ex.Message}");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync("{\"error\": \"JWT token has expired\"}");
             return;
         }
-        catch (SecurityTokenInvalidIssuerException)
+        catch (SecurityTokenInvalidIssuerException ex)
         {
+            Console.WriteLine($"❌ Invalid JWT token issuer: {ex.Message}");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync("{\"error\": \"Invalid JWT token issuer\"}");
             return;
         }
-        catch (SecurityTokenInvalidAudienceException)
+        catch (SecurityTokenInvalidAudienceException ex)
         {
+            Console.WriteLine($"❌ Invalid JWT token audience: {ex.Message}");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync("{\"error\": \"Invalid JWT token audience\"}");
             return;
         }
-        catch (SecurityTokenInvalidSignatureException)
+        catch (SecurityTokenInvalidSignatureException ex)
         {
+            Console.WriteLine($"❌ Invalid JWT token signature: {ex.Message}");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync("{\"error\": \"Invalid JWT token signature\"}");
@@ -151,16 +214,19 @@ public class JwtMiddleware
         }
         catch (SecurityTokenException ex)
         {
+            Console.WriteLine($"❌ Invalid JWT token: {ex.Message}");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync($" {{\"error\": \"Invalid JWT token: {ex.Message}\"}}");
+            await context.Response.WriteAsync($"{{\"error\": \"Invalid JWT token: {ex.Message}\"}}");
             return;
         }
         catch (Exception ex)
         {
+            Console.WriteLine($"❌ Token validation failed: {ex.Message}");
+            Console.WriteLine($"   Stack trace: {ex.StackTrace}");
             context.Response.StatusCode = 401;
             context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync($" {{\"error\": \"Token validation failed: {ex.Message}\"}}");
+            await context.Response.WriteAsync($"{{\"error\": \"Token validation failed: {ex.Message}\"}}");
             return;
         }
 
@@ -172,12 +238,9 @@ public class JwtMiddleware
         if (string.IsNullOrEmpty(path))
             return false;
 
-        // Check exact path matches
-        if (_excludedPaths.Contains(path, StringComparer.OrdinalIgnoreCase))
-            return true;
+        path = path.ToLowerInvariant();
 
-        // Check if path starts with any excluded path
         return _excludedPaths.Any(excluded =>
-            path.StartsWith(excluded, StringComparison.OrdinalIgnoreCase));
+            path.StartsWith(excluded.ToLowerInvariant(), StringComparison.OrdinalIgnoreCase));
     }
 }

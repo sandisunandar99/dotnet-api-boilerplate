@@ -3,17 +3,32 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Swashbuckle.AspNetCore.Filters;
+using System.IO;
 using System.Text;
 using App.Data;
 using App.Middlewares;
+using dotenv.net;
 
-var builder = WebApplication.CreateBuilder(args);
+// Load .env file at the very beginning
+DotEnv.Load(options: new DotEnvOptions(envFilePaths: new[] { ".env" }));
+
+// Build configuration
+var configurationBuilder = new ConfigurationBuilder()
+    .SetBasePath(Directory.GetCurrentDirectory())
+    .AddJsonFile("appsettings.json", optional: false)
+    .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT")}.json", optional: true)
+    .AddEnvironmentVariables();
+var configuration = configurationBuilder.Build();
+
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = args });
+builder.Configuration.AddConfiguration(configuration);
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
+
+// ✅ Properly configure Swagger with JWT security
 builder.Services.AddSwaggerGen(options =>
 {
-    // Add OpenAPI/Swagger document information
     options.SwaggerDoc("v1", new OpenApiInfo
     {
         Title = "Dotnet API Boilerplate",
@@ -26,7 +41,7 @@ builder.Services.AddSwaggerGen(options =>
         }
     });
 
-    // Security Definition
+    // ✅ Security Definition - Fixed configuration
     options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
         Name = "Authorization",
@@ -34,10 +49,27 @@ builder.Services.AddSwaggerGen(options =>
         Scheme = "bearer",
         BearerFormat = "JWT",
         In = ParameterLocation.Header,
-        Description = "Enter 'Bearer {token}'"
+        Description = "JWT Authorization header using the Bearer scheme. Enter your token in the text input below. Example: 'eyJhbGc...'  (Do NOT include 'Bearer' - it will be added automatically)"
     });
 
-    options.OperationFilter<SecurityRequirementsOperationFilter>();
+    // ✅ CRITICAL: Add global security requirement
+    options.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            Array.Empty<string>()
+        }
+    });
+
+    // Alternative: Use operation filter (you had this but it needs proper setup)
+    // options.OperationFilter<SecurityRequirementsOperationFilter>();
 });
 
 builder.Services.AddDbContext<AppDbContext>(options =>
@@ -47,9 +79,6 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     )
 );
 
-// JWT Configuration - Only for token generation, validation handled by custom middleware
-// Note: Removed AddAuthentication() and AddJwtBearer() to avoid conflict with custom middleware
-
 var app = builder.Build();
 
 if (app.Environment.IsDevelopment())
@@ -57,20 +86,16 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI(c =>
     {
-        // ✅ Correct path for .NET 8
         c.SwaggerEndpoint("/swagger/v1/swagger.json", "API v1");
         c.RoutePrefix = "swagger";
     });
 }
 
-
 app.UseHttpsRedirection();
 
-// Custom JWT middleware for token validation
+// ✅ Use custom middleware INSTEAD of standard authentication
 app.UseMiddleware<JwtMiddleware>();
 
-app.UseAuthentication();
-app.UseAuthorization();
 app.MapControllers();
 
 app.Run();
